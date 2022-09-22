@@ -1,0 +1,473 @@
+---
+title: "Interview preparation"
+author: "Diabb Zegpi"
+format: html
+editor: visual
+lang: es
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+theme_set(theme_bw())
+
+sheets <- excel_sheets('Data/Datos.xlsx')
+full_df <- 
+  tibble(sheets) |> 
+  mutate(data = map(sheets, ~ read_excel(path = 'Data/Datos.xlsx', sheet = .x)),
+         data = map(data, janitor::clean_names))
+
+full_df
+```
+
+### Problemática y plan de acción
+
+#### Gerente de operaciones
+
+-   46% de la producción fue confeccionada en una marca o presentación que no corresponde.
+
+-   La línea de A1 está saturada; la línea de A4 tiene tiempo ocioso.
+
+#### Gerente de ventas
+
+-   67% de los pedidos se entregan a tiempo y completos.
+
+-   El equipo de ventas debe re definir sus planes de ventas constantemente.
+
+#### Gerente de marketing
+
+-   Los equipos gastan mucho tiempo en trabajar con datos.
+
+-   Los analistas no llegan a resultados claros. No hay estrategia para solucionar el problema.
+
+### Preguntas
+
+1.  Cuál sería el objetivo de ventas **total** (en toneladas) al que el equipo de ventas deberá apuntar en los siguientes 6 meses? ¿A qué marca hay que prestar más atención y por qué?
+
+```{r}
+find_df <- function(sheet, clean_mes = FALSE) {
+  to_return_df <- full_df |> 
+    filter(sheets == sheet) |> 
+    pull(data) |> 
+    pluck(1)
+  
+  if (clean_mes) {
+    to_return_df <- to_return_df |> 
+      mutate(mes_ano = paste0(mes_ano, '01'),
+             mes_ano = as_date(mes_ano))
+  }
+  
+  return (to_return_df)
+}
+
+productos_marcas <- find_df('MAESTRO PRODUCTO')
+precios <- find_df('PRECIOS', TRUE)
+inversiones <- find_df('INVERSIONES', TRUE)
+coberturas <- find_df('COBERTURAS', TRUE)
+variables_externas <- find_df('VARIABLES EXTERNAS', TRUE) 
+ventas <- find_df('VENTAS', TRUE)
+```
+
+### Objetivo #1: pronosticar ventas (ton) por marca
+
+```{r}
+ventas_full <- ventas |> 
+  left_join(productos_marcas, by = 'producto') |> 
+  left_join(precios, by = c('mes_ano', 'tipo_clientes', 'producto')) |> 
+  left_join(inversiones, by = c('mes_ano', 'tipo_clientes', 'producto')) |> 
+  left_join(coberturas, by = c('mes_ano', 'tipo_clientes', 'producto'))
+```
+
+```{r}
+log_mean <- function(x, offset = 0.1) exp(mean(log(x + offset))) - offset
+
+ventas_summarised <- ventas_full |> 
+  group_by(mes_ano, marca, tipo_clientes) |> 
+  summarise(
+    ventas = sum(ventas_ton),
+    precio_ton = log_mean(precio_por_ton_usd),
+    inversion = log_mean(inversion),
+    cobertura = log_mean(percent_tiendas_impactadas),
+    .groups = 'drop'
+  )
+
+ventas_summarised |> 
+  pivot_longer(ventas:cobertura) |> 
+  ggplot(aes(x = mes_ano, y = value, color = tipo_clientes)) +
+  geom_line() +
+  facet_grid(name ~ marca, scales = 'free_y') + 
+  theme(legend.position = 'top')
+```
+
+Es interesante que gran parte de las ventas las consiguen las marcas 1 y 5, con mucha menor participación de la marca 6. Tal parece que la cobertura no es un buen predictor de las ventas, porque se mantiene relativamente estable en el tiempo (carece de varianza interesante). A priori, es razonable pensar que el precio sería un buen predictor de las ventas de productos con alta elasticidad de la demanda, o que su serie diferencia sí lo sería.
+
+### Matrices de correlación
+
+```{r}
+ventas_summarised |> 
+  select(where(is.numeric)) |> 
+  corrr::correlate(diagonal = 1) |> 
+  corrr::shave(upper = FALSE)
+```
+
+Efectivamente, el precio muestra una correlación lineal positiva con las ventas en toneladas. ¿Cómo se comporta la correlación al utilizar solamente las marcas 1 y 5?
+
+```{r}
+ventas_summarised |> 
+  filter(marca %in% c('MARCA1', 'MARCA5')) |> 
+  select(where(is.numeric)) |> 
+  corrr::correlate(diagonal = 1) |> 
+  corrr::shave(upper = FALSE)
+```
+
+Parece que el precio no afecta a las marcas más importantes, pero la cobertura sí tiene un gran impacto en ellas (negativo).
+
+```{r}
+transform_corm <- function(corm) {
+  corm %>%
+    pivot_longer(
+      cols = -term,
+      names_to = "colname",
+      values_to = "corr"
+    ) %>%
+    mutate(
+      rowname = fct_inorder(term),
+      colname = fct_inorder(colname),
+      label = ifelse(is.na(corr), "", sprintf("%1.2f", corr))
+    ) 
+}
+```
+
+```{r}
+ventas_summarised |> 
+  filter(marca %in% c('MARCA1', 'MARCA5')) |> 
+  select(where(is.numeric)) |> 
+  corrr::correlate(diagonal = 1) |> 
+  corrr::shave(upper = FALSE) |> 
+  transform_corm() |> 
+  ggplot(aes(rowname, fct_rev(colname), fill = corr)) +
+  geom_tile() +
+  geom_text(aes(
+    label = label,
+    color = abs(corr) < 0.75
+  )) +
+  coord_fixed(expand = FALSE) +
+  scale_color_manual(
+    values = c("white", "black"),
+    guide = "none"
+  ) +
+  scale_fill_distiller(
+    palette = "PuOr", na.value = "white",
+    direction = 1, limits = c(-1, 1),
+    name = "Correlación\nde Pearson:"
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme(panel.border = element_rect(color = NA, fill = NA),
+        plot.background = element_rect(fill = 'transparent', color = 'transparent'),
+        legend.background = element_rect(fill = NA),
+        legend.title = element_text(color = 'black'),
+        legend.text = element_text(color = 'black'),
+        axis.text = element_text(color = 'black'),
+        legend.position = c(.85, .8))
+```
+
+```{r}
+ventas_summarised |> 
+  filter(marca %in% c('MARCA1', 'MARCA5')) |> 
+  select(tipo_clientes, where(is.numeric)) |> 
+  pivot_longer(-tipo_clientes) |> 
+  mutate(row = row_number()) |> 
+  pivot_wider(names_from = tipo_clientes, values_from = value, values_fill = 0) |> 
+  mutate(row2 = row %/% 9) |> 
+  group_by(row2) |>
+  summarise(clientes_grandes = sum(`CLIENTES GRANDES`),
+            clientes_pequenos = sum(`CLIENTES PEQUEÑOS`), 
+            .groups = 'drop')
+  
+```
+
+```{r}
+variables_externas |> 
+  pivot_longer(-mes_ano) |> 
+  ggplot(aes(x = mes_ano, y = value)) +
+  geom_line() +
+  facet_wrap('name', scales = 'free_y', ncol = 1)
+```
+
+Se tienen los datos mensuales de la cantidad de días hábiles, la inflación (como porcentaje) y la temperatura (Celcius; se asume que la temperatura es media). Debido a que los datos de las variables adicionales SÍ cubren el período de observación de datos reales (ventas), son potenciales predictores para la variable ventas (ton). Se asumen los siguientes supuestos:
+
+-   Los días hábiles pueden ser relevantes, aunque varían poco. No es una de las variables a las que se prestará más atención durante el análisis.
+
+-   La inflación puede ser una factor relevante para la venta de productos con alta elasticidad precio.
+
+-   La temperatura definitivamente es interesante como predictor, porque se correlaciona con refrescos, helados y productos calientes.
+
+### Ventas
+
+Debido a que las ventas pro producto son una variable muy granular, que cuenta con pocos productos por marca, se prefiere usar la cantidad agregada de ventas. Se plantea la disyuntiva: ¿pronosticar por tipo de cliente? (jerárquico.)
+
+```{r}
+ventas_clientes <- 
+  ventas |> 
+  group_by(mes_ano, tipo_clientes) |> 
+  summarise(total = sum(ventas_ton), .groups = 'drop')
+
+ventas_clientes |> 
+  ggplot(aes(x = mes_ano, y = total, color = tipo_clientes)) +
+  geom_line() +
+  geom_smooth(formula = y ~ x, method = 'loess', se = FALSE)
+```
+
+Aparentemente, las ventas en toneladas por tipo de cliente siguen el mismo patrón estacional y la misma tendencia (si existiere). Sí es cierto que las ventas por clientes pequeños tuvieron una caída más drástica que en los clientes grandes para el mes de enero de 2019, y una subida más drástica en agosto de 2018. Aún así, estos cambios debiesen estar bien representados en la serie unificada.
+
+```{r}
+ventas |> 
+  group_by(mes_ano) |> 
+  summarise(total = sum(ventas_ton), .groups = 'drop') |> 
+  ggplot(aes(x = mes_ano, y = total)) +
+  geom_line() +
+  geom_smooth(formula = y ~ x, method = 'loess', se = FALSE)
+```
+
+...y así es, la serie global sí representa estas variaciones bruscas. Por último, se analiza si las variaciones (la derivada) es especialmente más pronunciada para los clientes pequeños.
+
+```{r}
+ventas_clientes |> 
+  group_by(tipo_clientes) |> 
+  mutate(d = total - lag(total)) |> 
+  ungroup() |> 
+  ggplot(aes(x = mes_ano, y = d, color = tipo_clientes)) +
+  geom_line() +
+  geom_smooth(formula = y ~ x, method = 'loess', se = FALSE)
+```
+
+La variación mensual en ambas series representa bien su tendencia. Finalmente, la serie de clientes pequeños es más inestable que la de los clientes grandes.
+
+#### Series de tiempo por marca
+
+```{r}
+ventas_tbl <- ventas_summarised |> 
+  select(-c(precio_ton:cobertura)) |> 
+  left_join(variables_externas, by = 'mes_ano') |> 
+  mutate(id = paste(tolower(marca), tolower(tipo_clientes), sep = '-')) |> 
+  select(id, mes_ano, ventas, temperatura, inflacion)
+```
+
+```{r}
+library(modeltime)
+library(timetk)
+library(tidymodels)
+
+ventas_tbl |> 
+  ggplot(aes(x = mes_ano, y = ventas)) +
+  geom_line() +
+  facet_wrap('id')
+```
+
+```{r}
+splits <- time_series_split(ventas_tbl, assess = '6 months', cumulative = TRUE, date_var = mes_ano)
+splits
+```
+
+```{r}
+preprocessing <- recipe(ventas ~ ., data = training(splits)) |> 
+  step_date(mes_ano, features = c('month', 'year'), keep_original_cols = FALSE) |> 
+  step_zv(all_predictors()) |> 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+
+summary(prep(preprocessing))
+```
+
+```{r}
+xgb_wflow <- workflow() |> 
+  add_model(boost_tree('regression') |> set_engine('xgboost')) |> 
+  add_recipe(preprocessing) |> 
+  fit(training(splits))
+
+xgb_wflow
+```
+
+```{r}
+model_tbl <- modeltime_table(xgb_wflow)
+model_tbl
+```
+
+#### Calibrar por id
+
+```{r}
+calib_tbl <- model_tbl |> 
+  modeltime_calibrate(
+    new_data = testing(splits),
+    id = 'id'
+  )
+calib_tbl
+```
+
+#### Midiendo el desempeño en el conjunto de prueba (global)
+
+```{r}
+calib_tbl |> 
+  modeltime_accuracy(acc_by_id = FALSE) |> 
+  table_modeltime_accuracy(.interactive = FALSE)
+```
+
+#### Desempeño local
+
+```{r}
+calib_tbl |> 
+  modeltime_accuracy(acc_by_id = TRUE) |> 
+  table_modeltime_accuracy(.interactive = FALSE)
+```
+
+#### Pronosticando los datos de prueba
+
+```{r}
+ventas_summarised |> 
+  select(-c(precio_ton:cobertura)) |> 
+  right_join(variables_externas, by = 'mes_ano') |> 
+  mutate(id = paste(tolower(marca), tolower(tipo_clientes), sep = '-')) |> 
+  select(id, mes_ano, ventas, temperatura, inflacion)
+
+to_forecast <- ventas_tbl |> 
+  distinct(id) |> 
+  mutate(external_vars = list(variables_externas |> select(-dias_habiles))) |> 
+  unnest(external_vars) |> 
+  filter(year(mes_ano) > 2019)
+```
+
+```{r}
+calib_tbl |> 
+  modeltime_forecast(
+    new_data = testing(splits),
+    actual_data = ventas_tbl,
+    conf_by_id = TRUE
+  ) |> 
+  ggplot(aes(x = .index, y = .value, color = .key)) +
+  geom_ribbon(aes(ymin = .conf_lo, ymax = .conf_hi)) +
+  geom_line() +
+  facet_wrap('id')
+```
+
+```{r}
+calib_tbl |> 
+  modeltime_forecast(
+    new_data = to_forecast,
+    actual_data = ventas_tbl,
+    conf_by_id = TRUE
+  ) |> 
+  ggplot(aes(x = .index, y = .value, color = .key)) +
+  geom_ribbon(aes(ymin = .conf_lo, ymax = .conf_hi)) +
+  geom_line() +
+  facet_wrap('id')
+
+```
+
+```{r}
+calib_tbl |> 
+  modeltime_forecast(
+    new_data = to_forecast,
+    actual_data = ventas_tbl,
+    conf_by_id = TRUE
+  ) |> 
+  filter(.key == 'prediction') |> 
+  summarise(sum(.value), sum(.conf_lo), sum(.conf_hi))
+```
+
+```{r}
+ventas_tbl |> 
+  group_by(mes_ano) |> 
+  summarise(ventas = sum(ventas), .groups = 'drop') |> 
+  mutate(m6 = ventas + lag(ventas) + lag(ventas, 2) + lag(ventas, 3) + lag(ventas, 4) + lag(ventas, 5),
+         pct = 1 - 9106.538	/ m6) |> 
+  tail()
+```
+
+```{r}
+p1 <- ventas_full |> 
+  mutate(ingresos = ventas_ton * precio_por_ton_usd,
+         margen = ingresos * (1 - inversion)) |> 
+  group_by(mes_ano, marca, tipo_clientes) |> 
+  summarise(margen_contribucion = sum(margen), .groups = 'drop') |> 
+  ggplot(aes(x = mes_ano, y = margen_contribucion / 1e6, color = tolower(tipo_clientes))) +
+  geom_line() +
+  scale_y_continuous(labels = scales::label_dollar(prefix = 'MM $')) +
+  scale_x_date(date_labels = '%y', date_breaks = '1 year') +
+  scale_color_manual(values = c('#db4f4d', '#692904')) +
+  facet_wrap('marca') +
+  theme(legend.position = 'none',
+        text = element_text(size = 14),
+        strip.background = element_rect(fill = NA, color = NA),
+        strip.text = element_text(size = 14, face = 'bold', hjust = 0, color = '#692904'),
+        panel.background = element_rect(fill = '#f8c0af'),
+        plot.background = element_rect(fill = '#f8c0af', color = NA),
+        panel.grid = element_line(color = '#dfd6d6')) +
+  labs(x = 'Año', y = 'Margen de contribución (USD)', color = NULL)
+
+ggsave(
+  filename = 'marcas.png',
+  plot = p1,
+  device = ragg::agg_png,
+  dpi = 300,
+  height = 6.5,
+  width = 8.5
+)
+```
+
+```{r}
+ventas_full |> 
+  mutate(ingresos = ventas_ton * precio_por_ton_usd,
+         margen = ingresos * (1 - inversion)) |> 
+  group_by(mes_ano, marca, tipo_clientes) |> 
+  summarise(margen_contribucion = sum(margen), .groups = 'drop') |> 
+  group_by(tipo_clientes, marca) |> 
+  summarise(margen = sum(margen_contribucion)) |> 
+  summarise(margen_total = sum(margen)) |> 
+  mutate(margen_total / sum(margen_total))
+```
+
+```{r}
+ventas_full |> 
+  mutate(ingresos = ventas_ton * precio_por_ton_usd,
+         margen = ingresos * (1 - inversion)) |> 
+  group_by(mes_ano, marca, tipo_clientes) |> 
+  summarise(margen_contribucion = sum(margen), .groups = 'drop') |> 
+  group_by(marca) |> 
+  summarise(margen = sum(margen_contribucion)) |> 
+  arrange(desc(margen)) |> 
+  mutate(pct = margen / sum(margen),
+         cumsum = cumsum(pct))
+```
+
+```{r}
+library(vip)
+p2 <- vi(extract_fit_parsnip(xgb_wflow)) |> 
+  filter(!str_detect(Variable, 'id_')) |> 
+  mutate(Variable = str_replace(Variable, 'mes_ano_month_', 'mes '),
+         Variable = str_replace(Variable, 'mes_ano_year', 'año'),
+         Variable = str_replace(Variable, 'inflacion', 'inflación'),
+         Variable = fct_reorder(Variable, Importance)) |> 
+  ggplot(aes(x = Importance, y = Variable, fill = Importance > 0.005)) +
+  geom_col(alpha = 0.8) +
+  scale_fill_manual(values = c('gray50', '#692904')) +
+  scale_x_continuous(expand = expansion(mult = c(0.01, 0.05))) +
+  theme(legend.position = 'none',
+        text = element_text(size = 14),
+        strip.background = element_rect(fill = NA, color = NA),
+        strip.text = element_text(size = 14, face = 'bold', hjust = 0, color = '#692904'),
+        panel.background = element_rect(fill = '#f8c0af'),
+        plot.background = element_rect(fill = '#f8c0af', color = NA),
+        panel.grid = element_line(color = '#dfd6d6')) +
+  labs(x = 'Importancia de variables', y = NULL, color = NULL)
+
+ggsave(
+  filename = 'variables_importantes.png',
+  plot = p2,
+  device = ragg::agg_png,
+  dpi = 300,
+  height = 6.5,
+  width = 8.5
+)
+```
