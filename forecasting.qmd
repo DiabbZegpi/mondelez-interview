@@ -141,8 +141,9 @@ transform_corm <- function(corm) {
 }
 ```
 
-```{r}
-ventas_summarised |> 
+```{r corr-plot}
+p_corr <- ventas_summarised |> 
+  rename('Ventas (ton)' = 'ventas', 'Precio ($/ton)' = 'precio_ton', 'Inversión (%)' = 'inversion', 'Cobertura (%)' = 'cobertura') |> 
   filter(marca %in% c('MARCA1', 'MARCA5')) |> 
   select(where(is.numeric)) |> 
   corrr::correlate(diagonal = 1) |> 
@@ -153,25 +154,42 @@ ventas_summarised |>
   geom_text(aes(
     label = label,
     color = abs(corr) < 0.75
-  )) +
+  ), size = 6) +
   coord_fixed(expand = FALSE) +
   scale_color_manual(
     values = c("white", "black"),
     guide = "none"
   ) +
-  scale_fill_distiller(
-    palette = "PuOr", na.value = "white",
-    direction = 1, limits = c(-1, 1),
+  scale_fill_gradient2(
+    low = '#c97926',
+    high = '#692904', 
+    mid = 'white',
+    midpoint = 0,
+    na.value = "#f8c0af",
+    limits = c(-1, 1),
     name = "Correlación\nde Pearson:"
   ) +
   labs(x = NULL, y = NULL) +
   theme(panel.border = element_rect(color = NA, fill = NA),
-        plot.background = element_rect(fill = 'transparent', color = 'transparent'),
         legend.background = element_rect(fill = NA),
         legend.title = element_text(color = 'black'),
         legend.text = element_text(color = 'black'),
         axis.text = element_text(color = 'black'),
-        legend.position = c(.85, .8))
+        legend.position = c(.85, .8),
+        text = element_text(size = 14),
+        panel.background = element_rect(fill = '#f8c0af'),
+        plot.background = element_rect(fill = '#f8c0af', color = '#f8c0af'),
+        panel.grid = element_line(color = '#dfd6d6'),
+        axis.ticks = element_blank())
+
+ggsave(
+  filename = 'matriz_correlacion.png',
+  plot = p_corr,
+  device = ragg::agg_png,
+  dpi = 300,
+  height = 6.5,
+  width = 8.5
+)
 ```
 
 ```{r}
@@ -287,12 +305,27 @@ xgb_wflow <- workflow() |>
   add_recipe(preprocessing) |> 
   fit(training(splits))
 
-xgb_wflow
+reg_wflow <- workflow() |> 
+  add_model(linear_reg('regression') |> set_engine('lm')) |> 
+  add_recipe(preprocessing) |> 
+  fit(training(splits))
+
+arima_wflow <- workflow() |> 
+  add_model(arima_reg('regression') |> set_engine('auto_arima')) |> 
+  add_recipe(recipe(ventas ~ mes_ano, data = training(splits))) |> 
+  fit(training(splits))
+
+prophet_wflow <- workflow() |> 
+  add_model(prophet_reg('regression') |> set_engine('prophet')) |> 
+  add_recipe(recipe(ventas ~ mes_ano, data = training(splits))) |> 
+  fit(training(splits))
 ```
 
 ```{r}
 model_tbl <- modeltime_table(xgb_wflow)
-model_tbl
+model_tbl2 <- modeltime_table(
+  xgb_wflow, reg_wflow, arima_wflow, prophet_wflow
+)
 ```
 
 #### Calibrar por id
@@ -303,13 +336,24 @@ calib_tbl <- model_tbl |>
     new_data = testing(splits),
     id = 'id'
   )
-calib_tbl
+
+calib_tbl2 <- model_tbl2 |> 
+  modeltime_calibrate(
+    new_data = testing(splits),
+    id = 'id'
+  )
 ```
 
 #### Midiendo el desempeño en el conjunto de prueba (global)
 
 ```{r}
 calib_tbl |> 
+  modeltime_accuracy(acc_by_id = FALSE) |> 
+  table_modeltime_accuracy(.interactive = FALSE)
+```
+
+```{r}
+calib_tbl2 |> 
   modeltime_accuracy(acc_by_id = FALSE) |> 
   table_modeltime_accuracy(.interactive = FALSE)
 ```
@@ -352,17 +396,38 @@ calib_tbl |>
 ```
 
 ```{r}
-calib_tbl |> 
+p_forecast <- calib_tbl |> 
   modeltime_forecast(
     new_data = to_forecast,
     actual_data = ventas_tbl,
     conf_by_id = TRUE
-  ) |> 
-  ggplot(aes(x = .index, y = .value, color = .key)) +
-  geom_ribbon(aes(ymin = .conf_lo, ymax = .conf_hi)) +
-  geom_line() +
-  facet_wrap('id')
+  ) |>
+  mutate(marca = str_extract(id, 'marca\\d'),
+         cliente = str_extract(id, '\\-(.+)'),
+         cliente = str_remove(cliente, '-')) |> 
+  ggplot(aes(x = .index, y = .value)) +
+  geom_ribbon(aes(ymin = .conf_lo, ymax = .conf_hi), fill = '#c97926') +
+  geom_line(aes(color = .key), group = 1) +
+  scale_color_manual(values = c('#db4f4d', '#692904')) +
+  facet_grid(marca ~ cliente) +
+  theme(legend.position = 'none',
+        text = element_text(size = 14),
+        strip.background = element_rect(fill = NA, color = NA),
+        strip.text = element_text(size = 14, face = 'bold', hjust = 0, color = '#692904'),
+        panel.background = element_rect(fill = '#f8c0af'),
+        plot.background = element_rect(fill = '#f8c0af', color = NA),
+        panel.grid = element_line(color = '#dfd6d6'),
+        strip.text.y = element_text(angle = 0)) +
+  labs(x = 'Fecha', y = 'Forecast de 6 meses (ton)')
 
+ggsave(
+  filename = 'forecast.png',
+  plot = p_forecast,
+  device = ragg::agg_png,
+  dpi = 300,
+  height = 6.5,
+  width = 8.5
+)
 ```
 
 ```{r}
